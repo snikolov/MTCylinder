@@ -1,0 +1,357 @@
+// C++ libs
+#include <cstdio>
+#include <cmath>
+#include <iostream>
+#include <iomanip>
+#include <fstream>
+#include <ctime>
+#include <string>
+#include <vector>
+
+// Numerical recipes
+#include <nr.h>
+using namespace std;
+
+
+const int seed = 1;
+
+//A structure that contains a triple, to be used for representing indices into a 3D grid
+struct triple
+{
+  int i,j,k;
+};
+  
+
+//Global method for generating unique IDs for filaments.
+int filament_id = 0;
+int next_id()
+{
+  int next = filament_id;
+  filament_id++;
+  return next;
+}
+
+class Point
+{
+public:
+  double x, y, z;
+
+  Point()
+  {
+    x = 0;
+    y = 0;
+    z = 0;
+  }
+  
+  Point(double x0, double y0, double z0)
+  {
+    x = x0;
+    y = y0;
+    z = z0;
+  }
+
+  Point add(Point other)
+  {
+    double x0,y0,z0;
+    x0 = x + other.x;
+    y0 = y + other.y;
+    z0 = z + other.z;
+
+    return Point(x0,y0,z0);
+  }
+  
+  struct point_string
+  {
+    char str[20];
+  };
+  
+  point_string to_string()
+  {
+    point_string ptstr;
+    sprintf(ptstr.str,"(%4.2f,%4.2f,%4.2f)",x,y,z);
+    return ptstr;
+  }
+
+};
+
+//Node structure for representing linked lists of pointers.
+class node
+{
+public:
+  Point point;
+  node* prev;
+  node()
+  {
+    prev = NULL;
+  }
+ 
+  node(Point point0, node* prev0)
+  {
+    point = point0;
+    prev = prev0;
+  }
+};
+
+
+
+class Filament
+{
+public:
+  vector<Point> points;
+  int id;
+
+  Filament(Point start = Point(2,2,0))
+  {
+    points.push_back(start);
+    id = next_id();
+  }
+  
+  //Determine a new vector to add to the current tip of the filament
+  Point delta_tip() 
+  {
+    int seed = 1;
+    double ranx,rany,ranz;
+    ranz = NR::sample_gauss(1.0) + 5;
+    rany = NR::sample_gauss(0.75);
+    ranx = NR::sample_gauss(0.75);
+    //cout << ranx << "\n" << rany << "\n" << ranz << "\n";
+    Point p = Point(ranx,rany,ranz);
+    //    return p;
+    return Point(0,0,.05);
+  }	
+  
+  void grow(Point delta_tip)  //grows the filament
+  {
+    Point tip = points[points.size()-1];
+    Point new_tip = tip.add(delta_tip);
+    //cout << "new tip " << new_tip.x << new_tip.y << new_tip.z << "\n";
+    //cout << "There are " << points.size() << " points in the filament \n";
+    points.push_back(new_tip);
+  }
+
+  void print()
+  {
+    for (int i = 0; i < points.size(); i++)
+      {
+	Point p = points[i];
+	cout << "(" << p.x << "," << p.y << "," << p.z << ")\n"; 
+      }
+  }
+  
+};
+
+
+
+
+class Grid3D
+{
+
+public:
+  double minx, maxx, miny, maxy, minz, maxz, xstep, ystep, zstep;
+  node**** cells;
+  vector<node> nodes; //Keeps copies of all nodes so that we can work with references to them.
+  
+  Grid3D()
+  {
+    //empty constructor
+  }
+  
+  void init(double minx0, double maxx0, double miny0, double maxy0,
+	    double minz0, double maxz0, double xstep0, double ystep0, double zstep0)
+  {
+    minx = minx0;
+    maxx = maxx0;
+    miny = miny0;
+    maxy = maxy0;
+    minz = minz0;
+    maxz = maxz0;
+    xstep = xstep0;
+    ystep = ystep0;
+    zstep = zstep0;
+    
+    int numx = (int) ceil(maxx/xstep);
+    int numy = (int) ceil(maxy/ystep);
+    int numz = (int) ceil(maxz/zstep);
+
+    //Allocate memory for cells.
+    cells = new node ***[numx];
+    for (int i = 0; i < numx; i++)
+      {
+	cells[i] = new node **[numy];
+        for (int j = 0; j < numy; j++)
+	  {
+	    cells[i][j] = new node *[numz];
+	  }
+      }
+
+    //Initialize each cell with an empty node.
+    for (int i = 0; i < numx; i++)
+      {
+	for (int j = 0; j < numy; j++)
+	  {
+	    for (int k = 0; k < numz; k++)
+	      {
+		cells[i][j][k] = NULL;
+	      }
+	  }
+      }
+  }
+
+  Grid3D(double minx0, double maxx0, double miny0, double maxy0, double minz0, 
+	 double maxz0, double xstep0, double ystep0, double zstep0)
+  {
+    init(minx0, maxx0, miny0, maxy0, minz0, maxz0, xstep0, ystep0, zstep0);
+  }
+
+  Grid3D(double minx0, double maxx0, double miny0, double maxy0, double minz0, 
+	 double maxz0, double step0)
+  {
+    init(minx0, maxx0, miny0, maxy0, minz0, maxz0, step0, step0, step0);
+  }
+  
+  //Converts a point to its corresponding indices in a 3D grid.
+  triple point_to_indices(Point p)
+  {
+    triple ijk;
+    ijk.i = (int) ceil((p.x - minx)/xstep);
+    ijk.j = (int) ceil((p.y - miny)/ystep);
+    ijk.k = (int) ceil((p.z - minz)/zstep);
+    return ijk;
+  }
+};
+
+
+
+
+class Axon
+{
+
+public:
+  double r; //radius of cylinder
+  vector<Filament> filaments; //A list of pointers to filaments
+  Grid3D grid; //3D grid containing a 3D array of pointers to Points
+
+  Axon(double radius, double length, double step)
+  {
+    r = radius;
+    //    Grid3D* temp = new Grid3D(2*radius, 2*radius, length, step);
+    // grid = *temp; //TODO: What's the difference?
+    grid = Grid3D(0, 2*radius, 0, 2*radius, 0, length, step);
+  }
+
+  Axon(double radius, double length, double xstep, double ystep, double zstep)
+  {
+    r = radius;
+    //    Grid3D *temp = new Grid3D(2*radius, 2*radius, length, xstep, ystep, zstep);
+    //    grid = *temp;
+    grid = Grid3D(0, 2*radius, 0, 2*radius, 0, length, xstep, ystep, zstep);
+  }
+  
+  void add_filament(Filament f)
+  {
+    filaments.push_back(f);
+  }
+
+  bool at_wall(Point p)
+  {
+    double eps = 0.2;
+    double y = p.y;
+    double x = p.x;
+
+    if ((y-r)*(y-r) + (x-r)*(x -r) > (r-eps)*(r-eps))
+      {
+	return true;
+      }
+    
+    return false;
+  }
+  
+  void update_filaments2()
+  {
+    //tower sampling to determine which filament to grow and how long it takes
+    //grow filament
+    //record new node in grid
+    //check for collisions
+
+    //tower sampling to determine fluctuations
+    //
+  }
+
+  void update_filaments()
+  {
+    Filament f;
+    
+    int in = 1;
+    int steps = 100;
+    for (int j = 0; j < steps; j++)
+      {
+	cin >> in;      
+	for (int i = 0; i < filaments.size(); i++)
+	  {
+	    cout << "filament " << i << "\n";
+	    f = filaments[i];
+	    f.print();
+	    
+	    Point tip = f.points[f.points.size() - 1];
+	    Point delta_tip = f.delta_tip();
+	    Point new_tip = tip.add(delta_tip);
+
+	    if (!at_wall(new_tip))
+	      {
+		f.grow(delta_tip);
+		cout << "Growing by " << (delta_tip.to_string()).str << "\n"
+		     << "New tip is " << (new_tip.to_string()).str << "\n\n";
+
+		//TODO check going out of bounds (especially for exceeding length of axon)!
+		triple ijk = grid.point_to_indices(new_tip);
+		int ii = ijk.i;
+		int jj = ijk.j;
+		int kk = ijk.k;
+
+		cout << "(" << ii << "," << jj << "," << kk << ")\n";
+
+		node* old_node;
+		old_node = grid.cells[ii][jj][kk];
+		node new_node;
+		if (old_node == NULL)
+		  {
+		    cout << "Old node is null";
+		    new_node = node(new_tip, NULL);
+		    grid.nodes.push_back(new_node);
+		    grid.cells[ii][jj][kk] = &grid.nodes[grid.nodes.size() - 1];
+		  }
+		else
+		  {
+		    cout << "Old node current: " << old_node << "\n"
+			 << "Old node previous: " << old_node->prev << "\n\n";
+		    
+		    new_node = node(new_tip, old_node);
+		    grid.nodes.push_back(new_node);
+		    grid.cells[ii][jj][kk] = &grid.nodes[grid.nodes.size() - 1];
+		    
+		    cout << "New node current: " << grid.cells[ii][jj][kk] << "\n"
+			 << "New node previous: " << new_node.prev << "\n\n";
+		  }
+	      }
+	    else
+	      {
+		cout << "At wall! Can't grow.";
+		//TODO
+	      }
+	    filaments[i] = f;
+	    cout << "\n\n"; 
+	  }
+      }
+  }
+};
+
+//Main
+int main()
+{
+  Axon a = Axon(2.0,20.0,0.8);
+  Filament f1 = Filament();
+  a.add_filament(f1);
+  a.update_filaments();
+  
+  return 0;
+}

@@ -1,0 +1,1611 @@
+// C++ libs
+#include <cstdio>
+#include <cmath>
+#include <iostream>
+#include <iomanip>
+#include <fstream>
+#include <ctime>
+#include <string>
+#include <vector>
+#include <list>
+
+//C libs
+#include <stdlib.h>
+
+// Numerical recipes
+#include "nr.h"
+
+//Constants/Global variables
+#include "constants.h"
+
+//Class declarations
+#include "node.h"
+#include "Grid3D.h"
+#include "Point.h"
+#include "Filament.h"
+#include "Axon.h"
+
+using namespace std;
+
+#define PI 3.14159265
+
+int DEBUG = 0;
+
+int RAND_SEED = 235769;
+const double LINK_INTERACTION_LEN = .1; // Maximum distance at which two microtubules can link
+const double LINK_LEN = 0.025; // The spacing between microtubules once they link.
+const double LINK_PROB = .5; // Probability of two nodes linking if they are close enough
+const double AXON_RADIUS = 2.0; // Axon radius
+const int MAX_NODES = 1000; // Maximum number of nodes in a microtubule filament.
+const int MAX_LINKS = 13; // Maximum number of linker proteins attached to node.
+
+const int NUM_STEPS = 4000;
+const int MAX_FILAMENTS = 4000;
+const double FILAMENT_RADIUS = 0.0125; // 12.5 nm
+const double FILAMENT_BIRTH_PROB = .85;
+const double PERSISTENCE_LEN = 30; // microns
+const double MEAN_LEN_GROWTH = 1.0; // microns
+const double STD_LEN_GROWTH = 0.2; // Standard dev. of growth length in microns.
+const double STD_THETA_GROWTH = PI/36.0; // Standard dev. of angle of deviation of growing tip
+
+// Global method for generating unique IDs for filaments.
+int filament_id = 0;
+int next_id()
+{
+  int next = filament_id;
+  filament_id++;
+  return next;
+}
+
+
+//-------------------------EXTERNAL METHODS------------------
+
+Point altitude_foot(Point p, Point q, Point r)
+{
+  // For a triangle defined by points p, q and r,
+  // determine the point of intersection between the
+  // segment from p to r and the segment perpendicular
+  // to it passing through q.
+
+  // Compute r - p
+  double v1,v2,p1,p2,p3,q1,q2,q3,r1,r2,s;
+  Point pr = Point::difference(r,p);
+  Point rq = Point::difference(q,r);
+  Point pr_x_rq = Point::cross(pr,rq);
+  Point v = Point::cross(pr,pr_x_rq);
+  s = (q.y - p.y + (v.y/v.x)*(p.x - q.x))/(r.y - p.y + (v.y/v.x)*(p.x - r.x));
+  Point intersection = Point((1-s)*p.x + s*r.x,
+			     (1-s)*p.y + s*r.y,
+			     (1-s)*p.z + s*r.z);
+  return intersection;
+}
+
+Point unrotate_sample(Point sample, Point q1, Point q2, Point q3)
+{
+  // Transforms a sample 'sample' in span{q1,q2} to a sample 'sample_xy' in the xy plane.  
+  // The distribution the sample is taken from is assumed to be invariant 
+  // to rotation about q3.
+
+  // In other words, let Q be an orthogonal matrix with columns q1,q2,q3.  Then 
+  // sample = Q*sample_xy, and sample_xy = Q'*sample
+ 
+  Point sample_xy = Point(Point::dot(q1,sample),
+			  Point::dot(q2, sample),
+			  Point::dot(q3, sample));
+  return sample_xy;
+}
+
+Point rotate_sample(Point sample, Point q1, Point q2, Point q3)
+{
+  // Transforms samples in the xy plane to
+  // the plane defined by the orthonormal basis {q1,q2,q3}, such that
+  // the unit z direction is mapped to q3. The
+  // distribution is assumed to be invariant to rotation
+  // about the z direction.
+
+  // Normalize, just in case
+  q3.normalize();
+  q2.normalize();
+  q1.normalize();
+  
+  // Transform sample
+  q1.scale(sample.x);
+  q2.scale(sample.y);
+  q3.scale(sample.z);
+  
+  Point result = Point::sum(q1, q2);
+  result = Point::sum(result, q3);
+  return result;  
+}
+
+
+double density_gauss(double x, double y)
+{
+  double sigma = .7;
+  return exp((-x*x - y*y)/(2*sigma*sigma));
+}
+
+double curve_hamiltonian(Point p1, Point p2, Point p3, Point p4, Point p5)
+{
+  // Computes the energy of a configuration of a chain of 5 consecutive points
+  // p1--p2--p3--p4--p5
+  
+  // Compute discrete tangent vectors
+  Point t1 = Point::difference(p2,p1);
+  Point t2 = Point::difference(p3,p2);
+  Point t3 = Point::difference(p4,p3);
+  Point t4 = Point::difference(p5,p4);
+  
+  // Compute segment lenghts;
+  double b1, b2, b3, b4;
+  b1 = t1.norm();
+  b2 = t2.norm();
+  b3 = t3.norm();
+  b4 = t4.norm();
+
+  // Normalize tangent vectors
+  t1.normalize();
+  t2.normalize();
+  t3.normalize();
+  t4.normalize();
+
+  // Compute Hamiltonian
+  double h = (1.0/b1)*(1.0 - Point::dot(t1,t2)) + 
+    (1.0/b2)*(1.0 - Point::dot(t2,t3)) +
+    (1.0/b3)*(1.0 - Point::dot(t3,t4));
+
+  h = h*PERSISTENCE_LEN;
+  return h;
+}
+
+//---------------------------------NODE------------------------------------
+
+//Node structure for representing linked lists of pointers.
+node::node()
+{
+  prev = NULL; 
+  next = NULL; 
+  up = NULL;
+  down = NULL;
+  axon = NULL;
+  link_grid = NULL;
+  collide_grid = NULL;
+  linked_to_wall = false;
+  num_links = 0;
+}
+
+node::node(Point point0, int filament_id0)
+{
+  links = (node**)malloc(sizeof*links * MAX_LINKS);
+  point = point0;
+  prev = NULL; 
+  next = NULL; 
+  up = NULL;
+  down = NULL;
+  axon = NULL;
+  link_grid = NULL;
+  collide_grid = NULL;
+  filament_id = filament_id0;
+  num_links = 0;
+  linked_to_wall = false;
+}
+
+void node::print_links()
+{
+  cout << "Node " << this << " is linked to: \n";
+
+  for (int i = 0; i < num_links; i++)
+    {
+      cout << links[i] << "\n";
+    }
+
+  cout << "\n";
+}
+
+bool node::contains_link(node* link)
+{
+  for (int i = 0; i < num_links; i++)
+    {
+      if (links[i] == link)
+	return true;
+    }
+  return false;
+}
+
+int num_rejected = 0;
+int num_total = 0;
+double avg_displ = 0; //avg displacement of fluctuations
+double avg_dist = 0; //avg distance from the center, updated with each accepted fluctuation
+double avg_signed_displ = 0;
+double current_dist = 0;
+
+void node::fluctuate(double (*hamiltonian)(Point,Point,Point,Point,Point) = curve_hamiltonian)
+{
+  num_total++;
+  int DEBUG0 = 0;
+
+  // Generates a fluctuation.  
+  // Takes: 
+  // - a pointer to a density function f
+  
+  // Determine perpendicular plane
+
+  if (up != NULL && down != NULL)
+    {
+      if (up->up != NULL && down->down != NULL)
+	{
+	  // Determine points in the chain: start--p--q--r--end
+	  Point start = down->down->point;
+	  Point end = up->up->point;
+	  Point r = up->point;
+	  Point q = this->point;
+	  Point p = down->point;
+	  Point intersection = altitude_foot(p,q,r);
+	  Point pr = Point::difference(r,p);
+	  Point rq = Point::difference(q,r);
+	  // Construct unit vectors q1, q2 such that {q1,q2,q3} is an orthonormal basis
+	  // and q3 || pr.
+	  Point q1 = Point::cross(pr,rq);
+	  Point q2 = Point::cross(pr,q1);
+	  Point q3 = pr;
+
+	  // Propose a fluctuation
+	  
+	  if (DEBUG0) cout << "Proposing fluctuation\n" << flush;
+	  
+	  double* proposed_xy;
+	  proposed_xy = (double*)malloc(sizeof*proposed_xy * 2);
+	  double sigma0 = .03;
+	  proposed_xy = NR::sample_gauss2(sigma0,proposed_xy); // Generates gaussian in the xy plane w/ sigma = sigma0
+	  Point proposed = rotate_sample(Point(proposed_xy[0], proposed_xy[1], 0), q1, q2, q3);
+	  Point new_q = Point::sum(proposed, q); 
+	    
+	  // Calculate energy of new and old configurations.
+	  double energy_old = (*hamiltonian)(start,p,q,r,end);
+	  double energy_new = (*hamiltonian)(start,p,new_q,r,end);
+	  
+	  double rand = NR::ran2(RAND_SEED);
+	  bool moved;
+	  if (rand < min(1.0, exp(-(energy_new - energy_old))))
+	    {
+	      // (Tentatively) accept fluctuation.  It can still be rejected if it is out of
+	      // bounds.
+	     
+	      // Try to move to new_q
+	      if (DEBUG0) cout << "Move accepted\n";
+	      
+
+	      /*
+		cout << "displacement " << proposed.norm() << "\n";
+	      avg_displ = (num_total - num_rejected)*avg_displ + proposed.norm();
+	      avg_displ = avg_displ/(num_total - num_rejected + 1);
+	      cout << "avg displacement " << avg_displ << "\n";
+	      
+	      current_dist = Point::difference(new_q, intersection).norm(); 
+	      avg_dist = avg_dist*(num_total - num_rejected) + current_dist;
+
+	      avg_dist = avg_dist/(num_total - num_rejected + 1);
+
+	      cout << "avg distance " << avg_dist << "\n";
+
+	      */
+
+
+	      moved = move(new_q);
+	      if (!moved && DEBUG0)
+		{
+		  if (DEBUG0) cout << "Move failed \n";
+		}
+	      else
+		{
+		  if (DEBUG0) cout << "Move succeeded \n";
+		}
+	    }    
+	  else
+	    {
+	      num_rejected++;
+	      if (DEBUG0) cout << "Move rejected.\n" << num_rejected << "/" 
+			       << num_total << " = " << double(num_rejected)/num_total << "\n";	            
+	    }
+	}
+      else 
+	{
+	  if (DEBUG0) cout << "Could not fluctuate " << this << " at point " << point.to_string().str 
+			   << "." <<  "up->up = " << up->up << " down->down = " << down->down << "\n";
+	}
+    }
+  else
+    {
+      if (DEBUG0) cout << "Could not fluctuate " << this << " at point " << point.to_string().str 
+		       << "." <<  "up = " << up << " down = " << down << "\n";
+    }
+}
+
+
+bool node::move(Point new_loc)
+{
+  bool m1 = false;
+  bool m2 = false;
+  m1 = move_within_grid(new_loc, link_grid);
+  //m2 = move_within_grid(new_loc, collide_grid);
+  return m1;
+}
+
+bool node::move_within_grid(Point new_loc, Grid3D *grid)
+{
+  triple ijk_new, ijk_old;
+
+  /*
+  cout << "this " << this << "\n";
+  cout << "this->point " << this->point.to_string().str << "\n";
+  cout << "getting old indices \n" << flush;
+  cout << "grid after " << grid << "\n";
+  */
+
+  ijk_old = grid->point_to_indices(this->point);
+
+  //  cout << "getting new indices \n" << flush;
+
+  ijk_new = grid->point_to_indices(new_loc);
+  
+  if (grid->in_range(grid->point_to_indices(new_loc)) && 
+      axon->in_cylinder(new_loc))
+    {
+      this->point = new_loc;
+      
+      if (DEBUG) cout << "Move in range of cylinder \n" << flush;
+      // Check if grid cell changes
+      
+      if (!(ijk_new.i == ijk_old.i &&
+	    ijk_new.j == ijk_old.j &&
+	    ijk_new.k == ijk_old.k))
+	{
+	  
+	  if (DEBUG) cout << "Proposed move accepted. Move node from cell (" 
+			  << ijk_old.i << "," << ijk_old.j << "," << ijk_old.k << ") to new cell (" 
+			  << ijk_new.i << "," << ijk_new.j << "," << ijk_new.k << ")\n" << flush;
+  
+	  grid->move_node(this, ijk_old);	    
+	}
+      else
+	{
+	  if (DEBUG) cout << "Node moved but stayed in grid cell (" << ijk_new.i << "," << ijk_new.j 
+			  << "," << ijk_new.k << ")\n"; 
+	}
+    }
+  else
+    {
+      if (DEBUG) cout << "Proposed move from cell (" << ijk_old.i << "," << ijk_old.j 
+		      << "," << ijk_old.k << ") to new cell (" << ijk_new.i << "," << ijk_new.j 
+		      << "," << ijk_new.k << ") rejected -- out of cylinder bounds.\n";
+      return false;
+    }
+  return true;
+}
+
+
+//----------------------POINT-------------------------------
+Point::Point()
+{
+  x = 0;
+  y = 0;
+  z = 0;
+}
+
+Point::Point(double x0, double y0, double z0)
+{
+  x = x0;
+  y = y0;
+  z = z0;
+}
+
+double Point::norm()
+{
+  return sqrt(x*x + y*y + z*z);
+}
+
+void Point::normalize()
+{
+  double norm = this->norm();
+  this->scale(1.0/norm);
+}
+
+void Point::scale(double s)
+{
+  x = x*s;
+  y = y*s;
+  z = z*s;
+}
+
+Point Point::sum(Point a, Point b)
+{
+  double x0,y0,z0;
+  x0 = a.x + b.x;
+  y0 = a.y + b.y;
+  z0 = a.z + b.z;
+  
+  return Point(x0,y0,z0);
+}
+
+Point Point::difference(Point a, Point b)
+{
+  double x0,y0,z0;
+  x0 = a.x - b.x;
+  y0 = a.y - b.y;
+  z0 = a.z - b.z;
+  
+  return Point(x0,y0,z0);
+}
+
+double Point::distance_to(Point other)
+{
+  double x0,y0,z0;
+  x0 = other.x;
+  y0 = other.y;
+  z0 = other.z;
+  
+  return sqrt((x-x0)*(x-x0) + (z-z0)*(z-z0) + (y-y0)*(y-y0));
+}
+
+point_string Point::to_string()
+{
+  point_string ptstr;
+  sprintf(ptstr.str,"(%4.2f,%4.2f,%4.2f)",x,y,z);
+  return ptstr;
+}
+
+Point Point::cross(Point a, Point b)
+{
+  return Point(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y -a.y*b.x);
+}
+
+double Point::dot(Point a, Point b)
+{
+  return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+
+
+
+//----------------------GRID3D--------------------------------
+
+Grid3D::Grid3D()
+{
+  //empty constructor
+}
+
+void Grid3D::init(double minx0, double maxx0, double miny0, double maxy0,
+	    double minz0, double maxz0, double xstep0, double ystep0, double zstep0)
+{
+  minx = minx0;
+  maxx = maxx0;
+  miny = miny0;
+  maxy = maxy0;
+  minz = minz0;
+  maxz = maxz0;
+  xstep = xstep0;
+  ystep = ystep0;
+  zstep = zstep0;
+  
+  int numx = (int) ceil((maxx-minx)/xstep);
+  int numy = (int) ceil((maxy-miny)/ystep);
+  int numz = (int) ceil((maxz-minz)/zstep);
+  
+  isize = numx;
+  jsize = numy;
+  ksize = numz;
+  
+  //Allocate memory for cells.
+  cells = new node***[numx];
+  for (int i = 0; i < numx; i++)
+    {
+      cells[i] = new node**[numy];
+      for (int j = 0; j < numy; j++)
+	{
+	  cells[i][j] = new node*[numz];
+	}
+    }
+  
+  //Initialize each cell with an empty node.
+  for (int i = 0; i < numx; i++)
+    {
+      for (int j = 0; j < numy; j++)
+	{
+	  for (int k = 0; k < numz; k++)
+	    {
+	      cells[i][j][k] = NULL;
+	    }
+	}
+    }
+}
+
+Grid3D::Grid3D(double minx0, double maxx0, double miny0, double maxy0, double minz0, 
+	       double maxz0, double xstep0, double ystep0, double zstep0)
+{
+  init(minx0, maxx0, miny0, maxy0, minz0, maxz0, xstep0, ystep0, zstep0);
+}
+
+Grid3D::Grid3D(double minx0, double maxx0, double miny0, double maxy0, double minz0, 
+       double maxz0, double step0)
+{
+  init(minx0, maxx0, miny0, maxy0, minz0, maxz0, step0, step0, step0);
+}
+
+//Converts a point to its corresponding indices in a 3D grid.
+triple Grid3D::point_to_indices(Point p)
+{
+  triple ijk;
+  ijk.i = (int) floor((p.x - minx)/xstep);
+  ijk.j = (int) floor((p.y - miny)/ystep);
+  ijk.k = (int) floor((p.z - minz)/zstep);
+  return ijk;
+}
+
+
+void Grid3D::add_node(node* new_node_ptr)
+{
+  if (new_node_ptr != NULL)
+    {
+      Point new_tip = new_node_ptr->point;
+      if (DEBUG) cout << (new_tip.to_string()).str << "\n";
+      triple ijk = this->point_to_indices(new_tip); //Get indices of new_tip in the grid
+     
+
+      //cout << "In add_node. new_node_ptr->grid is " << new_node_ptr->grid << "\n";
+
+
+      int ii = ijk.i;
+      int jj = ijk.j;	
+      int kk = ijk.k;
+      
+      if (in_range(ijk))
+	{
+	  if (this->cells[ii][jj][kk] == NULL)
+	    {
+	      //No existing nodes in this cell.
+	      if (DEBUG) cout << "No existing pointers in this grid cell.  Setting value to " << new_node_ptr << "\n";
+	      this->cells[ii][jj][kk] = new_node_ptr;
+	    }
+	  else
+	    {
+	      node* next0 = this->cells[ii][jj][kk]->next;
+	      node* prev0 = this->cells[ii][jj][kk]->prev;
+	      if (DEBUG) cout << "current->prev " << prev0 << " current " << this->cells[ii][jj][kk] << " current->next " << next0 << "\n";
+	      if (DEBUG) cout << "inserting new_node_ptr " << new_node_ptr << " after current " << this->cells[ii][jj][kk] << "\n";
+	      if (DEBUG) cout << "Setting " << this->cells[ii][jj][kk] << " -> " << new_node_ptr << "\n";
+	      
+	      this->cells[ii][jj][kk]->next = new_node_ptr;
+	      
+	      if (DEBUG) cout << "Setting " << this->cells[ii][jj][kk] << " <- " << new_node_ptr << "\n";
+	      new_node_ptr->prev = this->cells[ii][jj][kk];
+	      if (next0 != NULL)
+		{
+		  if (DEBUG) cout << "Setting " << new_node_ptr << " -> " << next0 << "\n";
+		  new_node_ptr->next = next0;
+		  if (DEBUG) cout << "Setting " << new_node_ptr << " <- " << next0 << "\n";
+		  next0->prev = new_node_ptr;
+		}
+	      // Set the grid cell to have the last added pointer
+	      this->cells[ii][jj][kk] = new_node_ptr;
+	      	      
+	      if (DEBUG)
+		{
+		cout << "Chain so far is :\n";
+		cout << this->cells[ii][jj][kk]->next << flush << " <-> " << flush << this->cells[ii][jj][kk] << flush;
+		node* p = this->cells[ii][jj][kk]->prev;
+		while(p != NULL)
+		  {
+		    cout << " <-> " << p << flush;
+		    p = p->prev;
+		  }
+		cout << " <-> 0\n";
+	      }
+	    }
+	}
+      else
+	{
+	  if (DEBUG) cout << "Node cannot be added to grid -- indices " << "(" << ii << "," << jj << "," << kk 
+	       << ") are out of range!  The maximum indicies of the grid are \nisize: " << this->isize - 1 << "\n"
+	       << "jsize: " << this->jsize - 1 << "\n"
+	       << "ksize: " << this->ksize - 1 << "\n";
+	}
+    }
+  else
+    {
+      //cout << "add_node(): Pointer to new node is NULL. \n";
+    }
+}
+
+void Grid3D::move_node(node* n, triple ijk_old)
+{
+  // Takes a pointer to a node n whose grid cell has changed
+  // Disconnects it from its current prev and next nodes.
+  // Connects the prev and next nodes to each other.
+  // Adds n to its new grid cell.
+  node* n_next = n->next;
+  node* n_prev = n->prev;
+  // If the value the old grid cell is n, then reassign value to its
+  // prev node before removing n (Note: this assumes that the node pointer
+  // stored in the grid cell is always the head of the list (i.e. its next pointer is NULL).
+  // This is how add_node() builds the list, so the two methods are consistent.
+  int i,j,k;
+  i = ijk_old.i;
+  j = ijk_old.j;
+  k = ijk_old.k;
+
+  //Reset prev and next of n to NULL
+  n->next = NULL;
+  n->prev = NULL;
+  
+  //Reassign pointers
+  if (cells[i][j][k] == n)
+    {
+      cells[i][j][k] = n_prev;
+      if (DEBUG) cout << "Removing node " << n << "\n"
+	   << "Setting cells[" << i << "][" << j << "][" << k << "] to " << n_prev << "\n";
+    }
+  if (n_next != NULL)
+    {
+      n_next->prev = n_prev;
+      if (DEBUG) cout << "Removing node " << n << "\n"
+	   << "Setting " << n_next << "->prev to " << n_prev << "\n";
+    }
+  if (n_prev != NULL)
+    {
+      n_prev->next = n_next;
+      if (DEBUG) cout << "Removing node " << n << "\n"
+	   << "Setting " << n_prev << "->next to " << n_next << "\n";
+    }
+  
+  add_node(n); // It is assumed that n's new position has already
+               // been set, so now we just add it using add_node(node* n)
+}
+
+bool Grid3D::in_range(triple ijk)
+{
+  int ii = ijk.i;
+  int jj = ijk.j;	
+  int kk = ijk.k;
+
+  if (ii < this->isize && ii >= 0 &&
+      jj < this->jsize && jj >= 0 &&
+      kk < this->ksize && kk >= 0)
+    return true;
+  else
+    return false;
+}
+
+//-----------------------------FILAMENT---------------------------
+Filament::Filament()
+{
+  // Do nothing.
+}
+
+Filament::Filament(Point start, double axon_raduis = AXON_RADIUS)
+{
+  nodes = (node*)malloc(sizeof*nodes * MAX_NODES);
+  id = next_id();
+  nodes[0]= node(start,id);
+  num_nodes = 1;
+}
+
+Filament::Filament(double axon_radius)
+{
+  nodes = (node*)malloc(sizeof*nodes * MAX_NODES);
+  id = next_id();
+  double* disk_sample;
+  disk_sample = (double*) malloc(sizeof*disk_sample * 2);
+  disk_sample = NR::sample_circle(disk_sample);
+  Point start = Point(axon_radius*disk_sample[0],
+		      axon_radius*disk_sample[1],
+		      0);
+  nodes[0] = node(start,id);
+  num_nodes = 1;
+}
+
+  //Determine a new vector to add to the current tip of the filament
+Point Filament::delta_tip() 
+{
+  double r,theta,phi;
+  r = NR::sample_gauss(STD_LEN_GROWTH) + MEAN_LEN_GROWTH;
+  phi = 2*PI*NR::ran2(RAND_SEED); // Pick phi uniformly
+  theta = NR::sample_gauss(STD_THETA_GROWTH);
+  //cout << ranx << "\n" << rany << "\n" << ranz << "\n";
+  Point prev_dir; // Direction of previous growth;
+  if (num_nodes-2 >= 0)
+    {
+      // Filament has at least two nodes already. Can determine direction
+      // of previous growth.
+      prev_dir = Point::difference(nodes[num_nodes - 1].point, nodes[num_nodes - 2].point);
+    }
+  else
+    {
+      // Filament has only 1 point (the one added at initialization). Assume prev_dir
+      // is (0,0,1), i.e., point does not need to be transformed.
+      Point init = Point(r*sin(theta)*sin(phi),r*sin(theta)*cos(phi),r*cos(theta));
+      return init;
+    }
+  prev_dir.normalize();
+  // Generate delta_tip in regular coordinate system.  Then transform such that
+  // (0,0,1) gets mapped to prev_dir.
+  Point init = Point(r*sin(theta)*sin(phi),r*sin(theta)*cos(phi),r*cos(theta));
+  //  cout << "init " << init.to_string().str << "\n";
+
+  // Generate two unit basis vectors q1, q2 such that {q1, q2, prev_dir} is an orthonormal
+  // basis.
+
+  // Pick a random vector;
+  double ranx, rany, ranz;
+  ranx = NR::ran2(RAND_SEED);
+  rany = NR::ran2(RAND_SEED);
+  ranz = NR::ran2(RAND_SEED);
+  Point rand = Point(ranx,rany,ranz);
+  Point q1 = Point::cross(rand, prev_dir);
+  q1.normalize();
+  Point q2 = Point::cross(q1,prev_dir);
+  q2.normalize();
+  Point delta_tip = rotate_sample(init, q1, q2, prev_dir);
+  
+  Point init_hat = init;
+  init_hat.normalize();
+  //cout << "init_hat*(0,0,1) = " << Point::dot(init_hat,Point(0,0,1)) << "\n";
+  Point delta_tip_hat = delta_tip;
+  delta_tip_hat.normalize();
+  //cout << "delta_tip_hat*prev_dir = " << Point::dot(delta_tip_hat,prev_dir) << "\n";
+  //cout << "theta = " << acos(Point::dot(delta_tip_hat,prev_dir))*180.0/PI << "\n";
+  return delta_tip;
+}	
+
+void Filament::grow(Point delta_tip)  //grows the filament
+{
+  int DEBUG0 = 0;
+
+  Point tip = nodes[num_nodes-1].point;
+  Point new_tip = Point::sum(tip,delta_tip);
+  //cout << "new tip " << new_tip.x << new_tip.y << new_tip.z << "\n";
+  //cout << "There are " << points.size() << " points in the filament \n";
+
+  node new_node = node(new_tip,id);
+  nodes[num_nodes] = new_node;
+  new_node.up = NULL;
+  if (num_nodes == 0)
+    {
+      nodes[num_nodes].down = NULL;
+      if (DEBUG0) cout << "num_nodes = 0\n"
+		       << "tip = " << nodes[0].point.to_string().str << "\n"; 
+    }
+  else
+    {
+      nodes[num_nodes].down = &nodes[num_nodes - 1];
+      if (DEBUG0) cout << "set" << &nodes[num_nodes] 
+		       << "->down to " << nodes[num_nodes].down << "\n";
+      nodes[num_nodes - 1].up = &nodes[num_nodes];
+    }
+
+  //cout << &nodes[num_nodes] << " --up-> " << nodes[num_nodes].up << "\n"
+  //	 << &nodes[num_nodes] << "--down-> " << nodes[num_nodes].down << "\n\n";
+  num_nodes++;
+}
+
+int Filament::slice(double z)
+{
+  // Determine the index of the point immediately below height z (and thus, the index
+  // of the one immediately above z).
+
+  // TODO: We assume for now that the filament has at least two points
+  // and that there exist two points on either side of height z.
+  // It follows from these assumptions that the first node is below z
+  // and the last point is above z.
+  int start, end, mid;
+
+  start = 0;
+  end = num_nodes - 1;
+  
+  if (start != end)
+    {
+       while (!(start == end - 1))
+	{
+	  mid = (int)((start + end)/2);
+	  
+	  if (nodes[mid].point.z > z)
+	    {
+	      end = mid;
+	    }
+	  else
+	    {
+	      start = mid;
+	    } 
+	}
+    }
+
+  return start;
+}
+
+void Filament::print()
+{
+  for (int i = 0; i < num_nodes; i++)
+    {
+      Point p = nodes[i].point;
+      if (DEBUG) cout << "(" << p.x << "," << p.y << "," << p.z << ")\n"; 
+    }
+}
+
+
+
+//-----------------------------------AXON----------------------------------------
+void Axon::init(double radius, double length0, double xstep, double ystep, double zstep)
+{
+  r = radius;
+  length = length0;
+  link_grid = Grid3D(-radius, radius, -radius, radius, 0, length, xstep, ystep, zstep);
+  collide_grid = Grid3D(-radius, radius, -radius, radius, 0, length, xstep, ystep, zstep);
+  filaments = (Filament*)malloc(sizeof*filaments * MAX_FILAMENTS);
+  num_filaments = 0;
+  total_nodes = 0;
+}
+
+Axon::Axon(double radius, double length, double xstep, double ystep, double zstep)
+{
+  init(radius, length, xstep, ystep, zstep);
+}
+
+Axon::Axon(double radius, double length, double step)
+{
+  init(radius, length, step, step, step);
+}
+
+Axon::Axon(double radius, double length)
+{
+  init(radius, length, LINK_INTERACTION_LEN, LINK_INTERACTION_LEN, LINK_INTERACTION_LEN);
+}
+
+Axon::Axon(double length)
+{
+  init(AXON_RADIUS, length, LINK_INTERACTION_LEN, LINK_INTERACTION_LEN, LINK_INTERACTION_LEN);
+}
+
+void Axon::add_filament(Filament f)
+{
+  if (num_filaments < MAX_FILAMENTS)
+    {
+      filaments[num_filaments] = f;
+      num_filaments++;
+    }
+}
+
+bool Axon::in_cylinder(Point p)
+{
+  double eps = LINK_INTERACTION_LEN;
+  double y = p.y;
+  double x = p.x;
+  
+  if (y*y + x*x > (r-eps)*(r-eps))
+    {
+      return false;
+    }
+  
+  return true;
+}
+
+bool Axon::at_wall(Point p)
+{
+  // Returns true if p within eps from wall,
+  // and false otherwise.
+  double eps = LINK_INTERACTION_LEN;
+  double y = p.y;
+  double x = p.x;
+  
+  if (y*y + x*x > (r-eps)*(r-eps) &&
+      y*y + x*x < r*r)
+    {
+      return true;
+    }
+  
+  return false;
+}
+
+void Axon::grow_filaments()
+{
+  Filament* f;
+  bool collision;
+  int index, num_nodes;
+  for (int i = 0; i < num_filaments; i++)
+    {
+      index = (int)floor(num_filaments*NR::ran2(RAND_SEED)); 
+      if (DEBUG) cout << "filament " << index << "\n";
+      f = &filaments[index];
+      //f->print();
+      
+      Point tip = f->nodes[f->num_nodes - 1].point;
+      Point delta_tip = f->delta_tip();
+      Point new_tip = Point::sum(tip,delta_tip);
+      
+      collision = check_collisions(tip, new_tip);
+      
+      if (in_cylinder(new_tip) &&
+	  link_grid.in_range(link_grid.point_to_indices(new_tip)) &&
+	  collide_grid.in_range(collide_grid.point_to_indices(new_tip)) &&
+	  !collision)
+	{
+	  f->grow(delta_tip);
+	  num_nodes = f->num_nodes;
+	  if (DEBUG)  cout << "Growing by " << (delta_tip.to_string()).str << "\n"
+			   << "New tip is " << (new_tip.to_string()).str << "\n\n";
+	  
+	  node* new_node_ptr = &(f->nodes[num_nodes - 1]); //Get address of the stored new_node.
+	  //cout << "...done. new_node_ptr has address " << new_node_ptr <<"\n"
+	  //     << "Adding new_node_ptr ...\n";
+	  new_node_ptr->axon = this;
+	  
+	  new_node_ptr->link_grid = &link_grid; // Let the node know the grids it is in.
+	  new_node_ptr->collide_grid = &collide_grid;
+
+	  link_grid.add_node(new_node_ptr); // Add new node pointer to the grids.
+	  //collide_grid.add_node(new_node_ptr);
+
+	  total_nodes++;
+	 
+	  // cout    << "Checking for links ... \n";
+
+	  //Looks for links between current node and other nodes.	  
+	  seek_links(new_node_ptr, LINK_INTERACTION_LEN, LINK_PROB);
+	  
+	  //cout << "...done\n";
+	  
+	}
+      else
+	{
+	  if (DEBUG) cout << "At wall! Can't grow.";
+	  //TODO
+	}
+    }
+}
+
+
+void Axon::fluctuate_filaments()
+{
+  int DEBUG0 = 0;
+
+  int findex, nindex; // Filament index and node index
+  Filament* f;
+  for (int m = 0; m < total_nodes; m++)
+    { 
+      // Pick a random filament
+      findex = (int)floor(NR::ran2(RAND_SEED)*num_filaments);
+      f = &filaments[findex];
+      nindex = (int)floor(NR::ran2(RAND_SEED)*(f->num_nodes));
+      node* fluct_node;
+      if (nindex >= 1)
+	{
+	  fluct_node = &f->nodes[nindex];
+	  if (DEBUG0) cout << "Picking the " << nindex + 1 << "th node at " << (fluct_node->point).to_string().str 
+			  << " from " << f->num_nodes << " nodes to fluctuate.\n" << flush;
+	  if (fluct_node->num_links == 0)
+	    {
+	      fluct_node->fluctuate();
+	      if (DEBUG0) cout << "Seeking links after fluctuation.\n";
+	     	      
+	      seek_links(fluct_node, LINK_INTERACTION_LEN, LINK_PROB); //Looks for links between current node and other nodes.
+	    }
+	  else
+	    {
+	      if (DEBUG0) cout << "Node is linked already. Cannot fluctuate.\n";
+	    }
+	}
+    }
+}
+
+void Axon::new_filament()
+{
+  if (NR::ran2(RAND_SEED) < FILAMENT_BIRTH_PROB)
+    {
+      Filament f = Filament(AXON_RADIUS);
+      this->add_filament(f);
+    }
+}
+
+void Axon::update_filaments()
+{
+  grow_filaments();
+  fluctuate_filaments();
+}
+
+void Axon::seek_links(node* new_node_ptr, double link_len, double link_prob)
+{
+  /*
+  int foo;
+  if (new_node_ptr->grid == NULL){
+    cout << "In seek_links.\n" 
+	 << "new_node_ptr = " << new_node_ptr << "\n"
+	 << "grid is " << new_node_ptr->grid << "\n"
+	 << "grid = " << new_node_ptr->grid << "\n"
+	 << "up = " << new_node_ptr->up << "\n"
+	 << "down = " << new_node_ptr->down << "\n"
+	 << "prev = " << new_node_ptr->prev << "\n"
+	 << "next = " << new_node_ptr->next << "\n"
+	 << "point = " << new_node_ptr->point.to_string().str << "\n";
+    cin >> foo;
+  }
+
+  */
+
+
+  Point new_tip = new_node_ptr->point;
+  triple ijk = link_grid.point_to_indices(new_tip); //Get indices of new_tip in the grid
+  int ii = ijk.i;
+  int jj = ijk.j;	
+  int kk = ijk.k;
+  
+  int i,j,k;
+  list<node*> node_list;
+  double distance;
+
+  //cout << "new_node_ptr grid " << new_node_ptr->grid << "\n";
+
+  if (DEBUG) cout << "At grid cell (" << ii << "," << jj << "," << kk << ")\n";
+  
+  for (int off_i = -1; off_i <= 1; off_i++)
+    {
+      for (int off_j = -1; off_j <= 1; off_j++)
+	{
+	  for (int off_k = -1; off_k <= 1; off_k++)
+	    {
+	      i = ii + off_i;
+	      j = jj + off_j;
+	      k = kk + off_k;
+	      
+	      //cout << "Checking neighboring cell (" << i << "," << j << "," << k << ")\n";
+	      
+	      if (i < link_grid.isize && i >= 0 &&
+		  j < link_grid.jsize && j >= 0 &&
+		  k < link_grid.ksize && k >= 0)
+		{
+		  if (link_grid.cells[i][j][k] != NULL)
+		    {
+		      node* node_ptr = link_grid.cells[i][j][k];
+		      bool linked = false;
+		      //Check backward for links
+		      if (DEBUG) cout << "Checking backward for links at (" << i << "," << j << "," << k << ")\n";
+		      //cout << "starting from " << grid.cells[i][j][k] << "\n";
+		      //cout << "node_ptr->prev is " << node_ptr << "\n";
+		      //cout << grid.cells[i][j][k]->next << " <-> " << grid.cells[i][j][k];
+		      while (node_ptr != NULL)
+			{
+			  //cout << "\t\tnode_ptr " << node_ptr << "\n" << flush; 
+			  linked = link(node_ptr, new_node_ptr);
+			  if (!linked)
+			    node_ptr = node_ptr->prev;
+			  else
+			    break;
+			}  
+		    }
+		}
+	      else
+		{
+		  //cout << "Grid cell (" << i << "," << j << "," << k << ") out of range\n";
+		}
+	    }
+	}
+    }
+}
+
+bool Axon::link(node* node_ptr, node* new_node_ptr)
+{
+  bool linked = false;
+  double distance, shift;
+  if (node_ptr != new_node_ptr &&
+      node_ptr->filament_id != new_node_ptr->filament_id)
+    {
+      distance = (node_ptr->point).distance_to(new_node_ptr->point);
+      if (DEBUG) cout << "Trying to link nodes at points " << ((node_ptr->point).to_string()).str
+		      << " and " << ((new_node_ptr->point).to_string()).str << " at distance " << distance << "\n" << flush;
+      //Calc distance.
+      if (distance <= LINK_INTERACTION_LEN)
+	{
+	  if (NR::ran2(RAND_SEED) < LINK_PROB)
+	    {
+	      //Check if both nodes have space for one more link
+	      if (MAX_LINKS - node_ptr->num_links >= 1 &&
+		  MAX_LINKS - new_node_ptr->num_links >= 1)
+		{
+		  if(!node_ptr->contains_link(new_node_ptr))
+		    {
+		      //Push nodes apart or pull them together so that they are at distance LINK_LEN
+		      Point delta = Point::difference(node_ptr->point, new_node_ptr->point);
+		      shift = 0.5*((LINK_LEN + 2*FILAMENT_RADIUS) - distance);
+
+		      delta.normalize();
+		      Point delta_tmp = delta;
+		     
+		      if (node_ptr->num_links == 0 && new_node_ptr->num_links == 0)
+			{
+			  // Move both nodes, since they are both free (have no
+			  // existing links).
+			
+			  // Add shift units along delta to node_ptr->point
+			  delta_tmp.scale(shift);
+			  
+			  node_ptr->move(Point::sum(delta_tmp,node_ptr->point));
+			 
+			  //Add shift units along -delta from new_node_ptr->point
+			  
+			  delta_tmp.scale(-1.0);
+			  new_node_ptr->move(Point::sum(new_node_ptr->point, delta_tmp));
+			  //new_node_ptr->print_links();
+			  //node_ptr->print_links();
+			  linked = true;
+			}
+		      else if (node_ptr->num_links > 0 && new_node_ptr->num_links == 0)
+			{
+			  // Move new_node_ptr
+			
+			  delta_tmp.scale(shift*2.0);
+			  delta_tmp.scale(-1.0);
+			  new_node_ptr->move(Point::sum(new_node_ptr->point, delta_tmp));
+			  linked = true;
+			}
+		      else if (new_node_ptr->num_links > 0 && node_ptr->num_links == 0)
+			{
+			  // Move node_ptr
+			  delta_tmp.scale(shift*2.0);
+			  node_ptr->move(Point::sum(node_ptr->point, delta_tmp));
+			  linked = true;
+			}
+		      else
+			{
+			  // Both nodes are linked somewhere; neither node is free to move.
+			  linked = false;
+			}
+		      
+		   
+		      if (DEBUG) cout << "Linking nodes at points " << ((node_ptr->point).to_string()).str
+				      << " and " << ((new_node_ptr->point).to_string()).str << " at distance " << distance << "\n" << flush;
+		      node_ptr->links[node_ptr->num_links] = new_node_ptr;
+		      new_node_ptr->links[new_node_ptr->num_links] = node_ptr;
+		      node_ptr->num_links += 1;
+		      new_node_ptr->num_links += 1;
+		     		      
+		    }
+		  else
+		    {
+		      if (DEBUG) cout << "Could not link. This link already exists.\n" << flush;
+		      linked = false;
+		    }
+		}
+	      else
+		{
+		  if (DEBUG) cout << "Could not link. At least one node has no more room for links. \n" << flush;
+		  linked = false;
+		}
+	    }
+	}
+    }
+  return linked;
+}
+
+
+double clip(double min, double max, double val)
+{
+  if (val < min)
+    return min;
+  if (val > max)
+    return max;
+  return val;
+}
+
+
+bool Axon::collision(Point s, Point e, Point p, Point q, double r)
+{
+  int DEBUG0 = 0;
+  // Checks for collision between 2 cylinders of radius r, respectively
+  // from s to e and p to q.
+  
+  // Doesn't work for collisions between parallel segments, but this should
+  // never happen.
+
+  double u,v,numu,denomu,numv,denomv;
+  Point es = Point::difference(e,s);
+  Point qp = Point::difference(q,p);
+  Point sp = Point::difference(s,p);
+ 
+  if (Point::dot(es,qp) - es.norm()*qp.norm() < 0.0001)
+    {
+      // Segments are parallel.  Assume they
+      // don't collide to avoid annoying special
+      // cases.
+
+      return false;
+    }
+  
+  numv = Point::dot(es,sp)*Point::dot(es,qp)
+    - Point::dot(sp,qp)*Point::dot(es,es);
+  if (DEBUG0) cout << "numv = " << numv << "\n";
+
+  denomv = pow(Point::dot(es,qp),2.0) 
+    - Point::dot(qp,qp)*Point::dot(es,es);
+  if (DEBUG0) cout << "denomv = " << denomv << "\n";
+
+  v = clip(0,1,numv/denomv);
+  if (DEBUG0) cout << "v = " << v << "\n";
+
+  numu = v*Point::dot(es,qp) - Point::dot(es,sp);
+  if (DEBUG0) cout << "numu = " << numu << "\n";
+
+  denomu = Point::dot(es,es);
+  if (DEBUG0) cout << "denomu = " << denomu << "\n";
+
+  u = clip(0,1,numu/denomu);
+  if (DEBUG0) cout << "u = " << u << "\n";
+
+  es.scale(u);
+  qp.scale(v);
+
+  Point min_dist = Point::sum(sp,Point::difference(es,qp));
+  if (DEBUG0) cout << "min dist = " << min_dist.norm() << "\n";
+  return (min_dist.norm() < r);
+}
+
+
+bool Axon::check_collisions(Point p, Point q)
+{
+  // Return true if the segment formed by p and q
+  // collides with any other segment, false otherwise.
+  return false;
+}
+
+
+int Axon::cross_section(double z, Point* points)
+{
+  // Takes an empty buffer that can hold num_filaments
+  // points and fills it with the points in the
+  // cross-section at z.
+
+
+  int i_below,i_above,num_pts;
+  double t,z0,x0,y0,dx,dy,dz,xi,yi,zi;
+  double x1,y1,z1;
+  Point delta, above, below;
+  num_pts = 0;
+  for (int i = 0; i < num_filaments; i++)
+    {
+      i_below = filaments[i].slice(z);
+      i_above = i_below + 1;
+      
+      if (i_above <= filaments[i].num_nodes - 1)
+	{
+	  above = filaments[i].nodes[i_above].point;
+	  below = filaments[i].nodes[i_below].point;
+	  delta = Point::difference(above,below);
+	  dx = delta.x;
+	  dy = delta.y;
+	  dz = delta.z;
+	  
+	  x0 = below.x;
+	  y0 = below.y;
+	  z0 = below.z;
+
+	  x1 = above.x;
+	  y1 = above.y;
+	  z1 = above.z;
+
+	  //cout << "below " << x0 << "," << y0 << "," << z0 << "\n"
+	  //     << "above " << x1 << "," << y1 << "," << z1 << "\n";
+	  
+	  t = (z - z0)/dz;
+
+	  xi = x0 + dx*t;
+	  yi = y0 + dy*t;
+	  zi = z0 + dz*t;
+	  
+	  //cout << xi << "," << yi << "," << zi << "\n";
+	  if (z1 > z)
+	    {
+	      points[num_pts] = Point(xi,yi,zi);
+	      num_pts++;
+	    }
+	}
+    }
+ 
+  return num_pts;
+}
+
+
+int Axon::count_links()
+{
+  Filament* f;
+  node* n;
+  int num_links = 0;
+  for (int i = 0; i < num_filaments; i++)
+    {
+      f = &filaments[i];
+      for (int j = 0; j < f->num_nodes; j++)
+	{
+	  n = &f->nodes[j];
+	  num_links += n->num_links;
+	}
+    }
+  return (int)(num_links/2);
+}
+
+
+ofstream output;
+
+
+void Axon::write_cross_section(Point* points, int num_pts, char* outfile)
+{
+  output.open(outfile);
+  double x,y,z;
+  output << "# Cross-section \n";
+  for (int i = 0; i < num_pts; i++)
+    {
+      x = points[i].x;
+      y = points[i].y;
+      z = points[i].z;
+     
+      output << x << "\t" << y << "\n"; 
+   }
+
+  output.close();
+}
+
+void Axon::write_distance_hist_all_pairs(Point* points, int num_pts, char* outfile)
+{
+  double dist,max_dist, bin_size;
+  int num_bins = 400;
+  int* hist;
+  hist = (int*)malloc(sizeof*hist * num_bins);
+  max_dist = 2*this->r;
+  bin_size = max_dist/num_bins;
+
+  // Initialize hist to 0;
+  for (int i = 0; i < num_bins; i++)
+    {
+      hist[i] = 0;
+    }
+  
+  for (int i = 0; i < num_pts; i++)
+    {
+      for (int j = i + 1; j < num_pts; j++)
+	{
+	  dist = points[i].distance_to(points[j]);
+	  hist[(int)floor(dist/bin_size)] += 1;
+	}
+    }
+  output.open(outfile);
+  for (int i = 0; i < num_bins; i++)
+    {
+      output << i*bin_size + 0.5*bin_size << "\t" << hist[i]/num_pts << "\n";
+    }
+  output.close();
+}
+
+
+void Axon::write_distance_hist_nn(Point* points, int num_pts, char* outfile)
+{
+  // Computes a distance histogram looking only at "nearest"-neighbors,
+  // that is, points that are in a circle of radius bucket_size/2
+  // centered at the current point.
+  cout << "In write_distance_hist_nn()\n";
+
+  double dist,max_dist, min_x, min_y, bin_size, bucket_size;
+  int num_bins = 20;
+  
+  int* hist;
+  hist = (int*)malloc(sizeof*hist * num_bins);
+
+  bucket_size = .2;
+  bin_size = 0.5*bucket_size/num_bins;
+ 
+  max_dist = this->r*2;
+  min_x = min_y = -this->r;
+  
+  // Map all points into a 2D grid with cells of side-length bucket_size
+  
+  //cout << "Allocating memory for grid\n";
+  // Allocate memory for grid
+  vector<Point>** grid;
+  int num_buckets = (int)ceil(max_dist/bucket_size);
+  grid = new vector<Point>*[num_buckets];
+  for (int i = 0; i < num_buckets; i++)
+    {
+      grid[i] = new vector<Point>[num_buckets];
+    }
+  
+  //cout << "Done. num_buckets = " << num_buckets << "\n";
+
+  //cout << "Mapping all points to grid\n";
+  
+  double x,y;
+  int i,j;
+  for (int m = 0; m < num_pts; m++)
+    {
+      x = points[m].x;
+      y = points[m].y;
+      i = (int)floor((x-min_x)/bucket_size);
+      j = (int)floor((y-min_y)/bucket_size);
+      //  cout << "Pushing back " << m << "th point address at " << i << "," << j << "\n";
+      grid[i][j].push_back(points[m]);
+    }
+  //cout << "Done.\n";
+  
+  //cout << "Initializing frequencies to 0\n";
+  // Initialize hist to 0;
+  for (int i = 0; i < num_bins; i++)
+    {
+      hist[i] = 0;
+    }
+  //cout << "Done.\n";
+
+  //cout << "Computing distances\n";
+  int num_distances = 0;
+  for (int m = 0; m < num_pts; m++)
+    {
+      x = points[m].x;
+      y = points[m].y;
+      i = (int)floor((x-min_x)/bucket_size);
+      j = (int)floor((y-min_y)/bucket_size);
+      
+      for (int k = 0; k < grid[i][j].size(); k++)
+	{
+	  //  cout << "Computing distance " << k << " from point " << m 
+	  //     << " in cell " << i << "," << j << "\n"; 
+
+	  dist = points[m].distance_to(grid[i][j][k]);
+	  if (dist < bucket_size/2.0 && dist > 0.00001) //if in circle
+	    {
+	      hist[(int)floor(dist/bin_size)] += 1;
+	      num_distances++;
+	    }
+	}
+    }
+
+  //  cout << "Writing histogram data\n";
+  output.open(outfile);
+  for (int i = 0; i < num_bins; i++)
+    {
+      output << i*bin_size + 0.5*bin_size << "\t" << hist[i]/num_distances << "\n";
+    }
+  output.close();
+
+  // cout << "Done writing distance histogram\n";
+}
+
+void Axon::write_scene(char* outfile)
+{
+  // Writes current scene to a .pov file for rendering
+  output.open(outfile);
+  output << "camera {\n"
+	 << "\t location <8,0,25> \n"
+	 << "\t look_at <0,0,25> \n"
+	 << "} \n"
+	 << "light_source{ \n"
+	 << "\t <15,5,25> \n"
+	 << "\t color rgb <1,1,1> \n"
+	 << "} \n";
+  Filament* f;
+  double x0,y0,z0,x1,y1,z1,xp,yp,zp;
+  
+  // Draw the axon as a transparent cylinder
+  output << "cylinder{ \n"
+	 << "\t <0,0,0>, "
+	 << "<0,0," << this->length << ">," << this->r << "\n"
+	 << "\t pigment { \n"
+	 << "\t\t color rgbt <1,1,1,.95> \n"
+	 << "\t } \n"
+	 << "} \n";
+
+  // Cylinder drawing loop -- draws each segment as a cylinder 
+
+  for (int i = 0; i < num_filaments; i++)
+    {
+      f = &filaments[i];
+      if (f->num_nodes > 0)
+	{
+	  x0 = (f->nodes[0].point).x;
+	  y0 = (f->nodes[0].point).y;
+	  z0 = (f->nodes[0].point).z;
+	}
+      for (int j = 1; j < f->num_nodes; j++)
+	{
+	  // Draw segments
+	  x1 = (f->nodes[j].point).x;
+	  y1 = (f->nodes[j].point).y;
+	  z1 = (f->nodes[j].point).z;
+	  
+	  output << "cylinder{ \n"
+		 << "\t <" << x0 << "," << y0 << "," << z0 << ">, "
+		 << "<" << x1 << "," << y1 << "," << z1 << ">, " 
+		 << FILAMENT_RADIUS << "\n"
+		 << "\t pigment { \n"
+		 << "\t\t color rgb <0,1,0> \n"
+		 << "\t } \n"
+		 << "} \n";
+
+	  x0 = x1;
+	  y0 = y1;
+	  z0 = z1;
+
+	  // Draw links between nodes
+	  if (f->nodes[j].num_links != 0)
+	    {
+	      for (int k = 0; k < f->nodes[j].num_links; k++)
+		{
+		  xp = (f->nodes[j].links[k]->point).x;
+		  yp = (f->nodes[j].links[k]->point).y;
+		  zp = (f->nodes[j].links[k]->point).z;
+		  
+		  //Point diff = Point::difference(f->nodes[j].point,f->nodes[j].links[k]->point);
+		  //cout << diff.norm() << "\n";
+		  // cout << sqrt((x0-xp)*(x0-xp) + (y0-yp)*(y0-yp)+ (z0-zp)*(z0-zp)) << "\n";
+		  
+		  output << "sphere{ \n"
+			 << "\t <" << 0.5*(x0+xp) << "," << 0.5*(y0+yp) << "," << 0.5*(z0+zp) << ">, "
+		    //<< "\t <" << xp << "," << yp << "," << zp << ">, .025 \n"
+			 << LINK_LEN << "\n"
+			 << "\t pigment { \n"
+			 << "\t\t color rgb <1,0,0> \n"
+			 << "\t } \n"
+			 << "} \n";
+		}
+	    }
+	}
+    } 
+  output.close();
+}
+
+
+//Main
+int main()
+{
+  Axon a = Axon(1000.0);
+
+  // File for writing output
+  char* outfile;
+  char* outfile2;
+  char* outfile3;
+  
+  // Buffer for computing cross sections
+  Point* cross_section_pts;
+  
+  outfile = (char*)malloc(sizeof*outfile * 50);
+  outfile2 = (char*)malloc(sizeof*outfile2 * 50);
+  outfile3 = (char*)malloc(sizeof*outfile3 * 50);
+
+  cross_section_pts = (Point*)malloc(sizeof*cross_section_pts * MAX_FILAMENTS);
+
+  for (int j = 0; j < NUM_STEPS; j++)
+    {
+      a.new_filament();
+      a.update_filaments();
+      
+      if (j%100 == 0)
+	cout << "step " << j << "\n";
+      if ((j+1) >= 1000 && (j+1) <= NUM_STEPS && (j+1)%100 == 0)
+	{
+	  // Write scene
+	  sprintf(outfile,"%s%d%s","./anim/scene",j+1,".pov");
+	  a.write_scene(outfile);
+	  cout << "Wrote scene at step " << j+1 << " to " << outfile << "\n";
+	  
+	  // Count the number of links
+	  cout << a.count_links() << "\n";
+	  
+	  // Count the number of filaments
+	  cout << a.num_filaments << "\n";
+
+	  //draw cross section
+	  double z = 20.0;
+	  sprintf(outfile2,"%s%d%s","./anim/cross",(j+1),".plot");
+	  int num_pts = a.cross_section(z,cross_section_pts);
+	  cout << "num_pts = " << num_pts << "\n";
+	  a.write_cross_section(cross_section_pts, num_pts, outfile2);
+	  sprintf(outfile3,"%s%d%s","./anim/cross_hist",(j+1),".plot");
+	  a.write_distance_hist_nn(cross_section_pts, num_pts, outfile3); 
+	  
+	  }
+    }
+  cout << "Completed " << NUM_STEPS << " steps\n";
+  
+    
+  return 0;
+}
+
